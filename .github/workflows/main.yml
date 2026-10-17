@@ -1,0 +1,91 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preparar projeto
+        run: |
+          if [ -f project.godot ]; then
+            P=.
+          else
+            unzip -o open-city-android.zip -d src
+            P=$(dirname "$(find src -name project.godot | head -n 1)")
+          fi
+          echo "PROJECT_PATH=$P" >> $GITHUB_ENV
+      - name: Ajustar projeto para Android
+        run: |
+          cd "$PROJECT_PATH"
+          if ! grep -q "import_etc2_astc" project.godot; then
+            sed -i '/^\[rendering\]/a textures/vram_compression/import_etc2_astc=true' project.godot
+          fi
+          grep -n -A4 "^\[rendering\]" project.godot
+          ls -la export_presets.cfg
+      - name: Instalar templates
+        run: |
+          if [ "$HOME" != "/root" ]; then
+            mkdir -p ~/.local/share/godot ~/.config
+            cp -r /root/.local/share/godot/export_templates ~/.local/share/godot/
+            cp -r /root/.config/godot ~/.config/ || true
+          fi
+          ls ~/.local/share/godot/export_templates/
+      - name: Configurar Android
+        run: |
+          SM=$(find / -name sdkmanager -type f 2>/dev/null | head -n 1) || true
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/lib/android-sdk}}
+          if [ -n "$SM" ]; then
+            yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null || true
+            "$SM" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null || true
+          fi
+          if [ ! -e "$SDK/cmdline-tools/latest/bin/sdkmanager" ] && [ -n "$SM" ]; then
+            SMDIR=$(dirname "$(dirname "$SM")")
+            mkdir -p "$SDK/cmdline-tools"
+            ln -sfn "$SMDIR" "$SDK/cmdline-tools/latest"
+          fi
+          JAVA=$(dirname "$(dirname "$(readlink -f "$(which java)")")")
+          KS=/root/debug.keystore
+          if [ ! -f "$KS" ]; then
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey -keypass android -keystore "$KS" -storepass android -dname "CN=Android Debug,O=Android,C=US" -validity 9999 -deststoretype pkcs12
+          fi
+          mkdir -p ~/.config/godot
+          F=$(ls ~/.config/godot/editor_settings*.tres 2>/dev/null | head -n 1) || true
+          if [ -z "$F" ]; then
+            F=~/.config/godot/editor_settings-4.3.tres
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\n' > "$F"
+          fi
+          sed -i '/^export\/android\//d' "$F"
+          printf 'export/android/android_sdk_path = "%s"\n' "$SDK" >> "$F"
+          printf 'export/android/java_sdk_path = "%s"\n' "$JAVA" >> "$F"
+          printf 'export/android/debug_keystore = "%s"\n' "$KS" >> "$F"
+          printf 'export/android/debug_keystore_user = "androiddebugkey"\n' >> "$F"
+          printf 'export/android/debug_keystore_pass = "android"\n' >> "$F"
+      - name: Testes automatizados
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_PATH"
+          godot --headless --import || true
+          godot --headless --path . -s tests/run_tests.gd
+      - name: Exportar APK
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build"
+          cd "$PROJECT_PATH"
+          RC=0
+          godot --headless --verbose --export-debug "Android" "$GITHUB_WORKSPACE/build/open-city.apk" > /tmp/export.log 2>&1 || RC=$?
+          echo "===== FIM DO LOG DO GODOT ====="
+          tail -n 60 /tmp/export.log | cat -v
+          echo "===== LINHAS COM ERRO ====="
+          grep -i -n -B1 -A3 "error\|erro\|requires\|invalid" /tmp/export.log | cat -v | head -n 60 || true
+          exit $RC
+      - name: Publicar APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Open City build ${{ github.run_number }}
+          files: build/open-city.apk
